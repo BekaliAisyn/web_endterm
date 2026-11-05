@@ -1,0 +1,107 @@
+"""Run with: python3 tests/browser_check.py (requires Playwright and Chromium).
+Start the site first: python3 -m http.server 8000. Screenshots go to screenshots/.
+"""
+from pathlib import Path
+import json
+from playwright.sync_api import sync_playwright
+ROOT=Path(__file__).resolve().parents[1]
+BASE='http://127.0.0.1:8000/'
+results=[]
+def check(condition,label):
+    assert condition,label
+    results.append(label)
+with sync_playwright() as p:
+    browser=p.chromium.launch(executable_path='/usr/bin/chromium',args=['--no-sandbox'])
+    context=browser.new_context(viewport={'width':1440,'height':1000},device_scale_factor=1)
+    page=context.new_page()
+    errors=[]
+    page.on('pageerror',lambda error: errors.append(str(error)))
+    page.on('response',lambda response: errors.append(f'HTTP {response.status}: {response.url}') if response.status>=400 else None)
+    for width,label in [(1440,'desktop'),(768,'tablet'),(390,'mobile')]:
+        page.set_viewport_size({'width':width,'height':1000 if width>500 else 844})
+        for name in ['index','projects','about','journal','contact']:
+            response=page.goto(BASE+name+'.html')
+            check(response.status==200,f'{label}: {name} loads')
+            check(page.locator('h1').count()==1,f'{label}: {name} has one main heading')
+            check(page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'{label}: {name} has no horizontal overflow')
+            check(page.locator('nav [aria-current="page"]').count()==1,f'{label}: {name} marks active navigation')
+            page.locator('img[src]').evaluate_all('(images) => images.forEach(i => i.loading = "eager")')
+            page.wait_for_function('Array.from(document.querySelectorAll("img[src]")).every(i => i.complete && i.naturalWidth > 0)')
+            check(True,f'{label}: {name} images load')
+            page.screenshot(path=str(ROOT/'screenshots'/f'{name}-{label}.png'),full_page=True)
+    page.locator('.navbar-toggler').click()
+    check(page.locator('#navigation').is_visible(),'Mobile navigation expands')
+    page.locator('#navigation a[href="projects.html"]').click()
+    check(page.url.endswith('projects.html'),'Mobile navigation follows link')
+    page.set_viewport_size({'width':1440,'height':1000})
+    page.locator('[data-filter="grid"]').click()
+    check(page.locator('#project-grid .project-item:visible').count()==2,'Web design filter shows two projects')
+    page.locator('[data-filter="ui"]').click()
+    check(page.locator('#project-grid .project-item:visible').count()==1,'UI filter shows one project')
+    page.locator('[data-filter="saved"]').click()
+    check(page.locator('#empty-projects').is_visible(),'Saved filter has meaningful empty state')
+    page.locator('[data-filter="all"]').click()
+    page.locator('[data-save="02"]').click()
+    page.reload()
+    check(page.locator('[data-save="02"]').get_attribute('aria-pressed')=='true','Saved projects survive reload')
+    page.locator('[data-filter="saved"]').click()
+    check(page.locator('#project-grid .project-item:visible').count()==1,'Saved filter shows selected project')
+    page.locator('[data-save="02"]').click()
+    check(page.locator('#empty-projects').is_visible(),'Unsave updates active saved filter')
+    page.locator('[data-filter="all"]').click()
+    page.locator('.project-image[data-project="01"]').click()
+    page.locator('#projectModal').wait_for(state='visible')
+    page.wait_for_function('document.activeElement.id === "projectModal"')
+    check(page.locator('#project-title').inner_text()=='Room to Grow','Modal displays correct project')
+    page.screenshot(path=str(ROOT/'screenshots'/'project-modal.png'))
+    page.keyboard.press('Escape')
+    page.locator('#projectModal').wait_for(state='hidden')
+    page.wait_for_function("document.activeElement.dataset.project === '01' && document.activeElement.classList.contains('project-image')")
+    check(page.locator('.project-image[data-project="01"]').evaluate('(e) => e===document.activeElement'),'Modal restores keyboard focus')
+    page.goto(BASE+'journal.html')
+    page.locator('#toggle-01').click()
+    page.wait_for_timeout(300)
+    check(page.locator('#note-01').is_visible(),'jQuery note expands')
+    page.screenshot(path=str(ROOT/'screenshots'/'journal-expanded.png'),full_page=True)
+    page.locator('#toggle-01').click()
+    page.wait_for_timeout(300)
+    check(page.locator('#note-01').is_hidden(),'jQuery note collapses')
+    page.emulate_media(reduced_motion='reduce')
+    page.locator('#toggle-02').click()
+    check(page.locator('#note-02').is_visible(),'Reduced-motion journal expansion works')
+    page.goto(BASE+'contact.html')
+    page.locator('button[type="submit"]').click()
+    check(page.locator('#name').get_attribute('aria-invalid')=='true','Empty form rejected')
+    page.screenshot(path=str(ROOT/'screenshots'/'contact-invalid.png'),full_page=True)
+    page.locator('#name').fill('  ')
+    page.locator('#email').fill('incorrect')
+    page.locator('#topic').select_option(label='Project feedback')
+    page.locator('#message').fill(' '*25)
+    page.locator('#consent').check()
+    page.locator('button[type="submit"]').click()
+    check(page.locator('#name').get_attribute('aria-invalid')=='true','Whitespace name rejected')
+    check(page.locator('#email').get_attribute('aria-invalid')=='true','Invalid email rejected')
+    check(page.locator('#message').get_attribute('aria-invalid')=='true','Whitespace message rejected')
+    page.locator('#name').fill('Sample Visitor')
+    page.locator('#email').fill('visitor@example.com')
+    page.locator('#message').fill('This is a sample message to test the portfolio form.')
+    page.locator('#consent').uncheck()
+    page.locator('button[type="submit"]').click()
+    check(page.locator('#consent').get_attribute('aria-invalid')=='true','Missing consent rejected')
+    page.locator('#consent').check()
+    page.locator('button[type="submit"]').click()
+    check('nothing was sent or stored' in page.locator('#form-status').inner_text(),'Valid form shows honest local confirmation')
+    check(page.locator('#message-count').inner_text()=='0 / 1000','Form resets after success')
+    page.screenshot(path=str(ROOT/'screenshots'/'contact-success.png'),full_page=True)
+    # Check every local link and referenced file on each page.
+    from urllib.parse import urljoin,urlparse
+    for name in ['index','projects','about','journal','contact']:
+        page.goto(BASE+name+'.html')
+        for url in page.locator('a[href],link[href],script[src],img[src]').evaluate_all('(els) => els.map(e => e.getAttribute("href") || e.getAttribute("src"))'):
+            if not url.startswith('#'):
+                target=urljoin(BASE,url)
+                check(context.request.get(target).status==200,f'Local resource OK: {name} → {url}')
+    check(not errors,'No browser JavaScript or HTTP errors: '+str(errors))
+    browser.close()
+(ROOT/'docs'/'test-results.json').write_text(json.dumps({'passed':len(results),'failed':0,'checks':results},indent=2))
+print(f'PASS: {len(results)} checks; screenshots saved for desktop/tablet/mobile and interactions.')
